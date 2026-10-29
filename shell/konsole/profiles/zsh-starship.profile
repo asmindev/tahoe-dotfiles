@@ -1,5 +1,5 @@
 [Appearance]
-ColorScheme=Breeze
+ColorScheme=MacTahoe
 Font=SF Mono,10,-1,5,400,0,0,0,0,0,0,0,0,0,0,1,,0,0
 TabActivityColor=255,255,255
 TabColor=46,46,46,0

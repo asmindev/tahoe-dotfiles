@@ -66,6 +66,7 @@ THEME_MAPPINGS = [
     ("gtk-4.0/colors.css", ".config/gtk-4.0/colors.css"),
     ("xsettingsd.conf", ".config/xsettingsd/xsettingsd.conf"),
     (".gtkrc-2.0", ".gtkrc-2.0"),
+    ("konsole/MacTahoe.colorscheme", ".local/share/konsole/MacTahoe.colorscheme"),
 ]
 
 SYNC_IGNORE = ("*.bak", "*.bak.*", "*.toml.*", "*.tbcache", "*~")
