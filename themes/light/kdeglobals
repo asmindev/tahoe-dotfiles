@@ -142,6 +142,9 @@ smallestReadableFont=SF Pro Display,8,-1,5,50,0,0,0,0,0
 taskbarFont=SF Pro Display,10,-1,5,50,0,0,0,0,0
 toolBarFont=SF Pro Display,10,-1,5,50,0,0,0,0,0
 
+[Icons]
+Theme=MacTahoe
+
 [KDE]
 LookAndFeelPackage=MY LIGHT TAHOE
 ShowDeleteCommand=false
