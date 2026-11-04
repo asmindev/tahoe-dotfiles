@@ -1,0 +1,83 @@
+--- a/proton/vpn/app/gtk/widgets/headerbar/menu/menu.py
++++ b/proton/vpn/app/gtk/widgets/headerbar/menu/menu.py
+@@ -114,6 +114,7 @@
+         self._dialog_callback = None
+ 
+         self._setup_actions()
++        self._export_dbusmenu()
+ 
+     def status_update(self, connection_status: State):
+         """
+@@ -181,6 +182,72 @@
+             self.quit_action, "activate", self._on_quit_clicked
+         )
+ 
++    def _export_dbusmenu(self):
++        try:
++            import gi
++            gi.require_version("Dbusmenu", "0.4")
++            from gi.repository import Dbusmenu
++        except (ImportError, ValueError):
++            logger.warning("Dbusmenu typelib not available, skipping global menu export")
++            return
++
++        self._dbusmenu_actions = {
++            "about": self.about_action,
++            "settings": self.settings_action,
++            "release_notes": self.release_notes_action,
++            "report": self.bug_report_action,
++            "logout": self.logout_action,
++            "quit": self.quit_action,
++        }
++        self._dbusmenu_root = Dbusmenu.Menuitem.new()
++        self._dbusmenu_root.property_set("label", "")
++        self._dbusmenu_root.property_set("children-display", "submenu")
++
++        for index in range(self.get_n_items()):
++            label = self.get_item_attribute_value(
++                index, "label", GLib.VariantType.new("s")
++            )
++            action = self.get_item_attribute_value(
++                index, "action", GLib.VariantType.new("s")
++            )
++            if label is None:
++                continue
++
++            item = Dbusmenu.Menuitem.new()
++            item.property_set("label", label.get_string())
++            item.property_set_bool("visible", True)
++
++            if action is None:
++                item.property_set("type", "separator")
++                item.property_set_bool("enabled", False)
++            else:
++                action_name = action.get_string().split(".", 1)[-1]
++                gio_action = self._dbusmenu_actions.get(action_name)
++                if gio_action is not None:
++                    item.property_set_bool("enabled", gio_action.get_enabled())
++                    gio_action.connect(
++                        "notify::enabled", self._on_action_enabled_changed, item
++                    )
++                item.connect(
++                    "item-activated",
++                    self._on_dbusmenu_item_activated,
++                    action_name,
++                )
++
++            self._dbusmenu_root.child_append(item)
++
++        self._dbusmenu_server = Dbusmenu.Server.new("/com/canonical/menu/0")
++        self._dbusmenu_server.set_root(self._dbusmenu_root)
++        logger.info("Exported global menu on /com/canonical/menu/0")
++
++    def _on_dbusmenu_item_activated(self, _item, _timestamp, action_name):
++        action = self._dbusmenu_actions.get(action_name)
++        if action is not None:
++            action.activate(None)
++
++    def _on_action_enabled_changed(self, action, _pspec, item):
++        item.property_set_bool("enabled", action.get_enabled())
++
+     def _on_report_an_issue_clicked(self, *_):
+         self._bug_dialog = BugReportDialog(self._controller, self._main_window)
+         self._bug_dialog.set_transient_for(self._main_window)

@@ -5,7 +5,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERSION="1.13"
 SRC_DIR="${QUICKBAR_SRC:-$HOME/.cache/quickbar-src}"
 BUILD_DIR="${QUICKBAR_BUILD:-$HOME/.cache/quickbar-build}"
-PATCH="$DIR/vscode-appmenu.patch"
+PATCH="$DIR/appmenu-pid-discovery.patch"
 
 echo "==> Fetching QuickBar v$VERSION..."
 if [ ! -d "$SRC_DIR/.git" ]; then
@@ -15,7 +15,7 @@ else
     git -C "$SRC_DIR" checkout --force FETCH_HEAD
 fi
 
-echo "==> Applying VS Code appmenu patch..."
+echo "==> Applying appmenu PID discovery patch..."
 git -C "$SRC_DIR" apply "$PATCH"
 
 echo "==> Configuring with CMake..."

@@ -75,7 +75,7 @@ The repository follows a domain-oriented layout:
 - `desktop/` contains Plasma, KWin, decoration, effect, and notification applet files.
 - `themes/` contains the active light and dark overrides, plus shared GTK assets and color schemes.
 - `shell/` contains Zsh, Konsole, Alacritty, CAVA, and Starship configuration.
-- `apps/` contains application-specific configuration for Dolphin and Albert.
+- `apps/` contains application-specific configuration for Dolphin, Albert, and Proton VPN.
 - `tooling/` contains the icon conversion package, developer scripts, and tests.
 - `installer/` contains the installer, the sync script, shared path mappings, and package list.
 - `assets/` contains patches and standalone icon assets used by the installer.
@@ -128,7 +128,7 @@ dotfiles/
 │       │   ├── org.kde.mac-tahoe-liquid-kde.launcher/
 │       │   └── org.kde.mac-tahoe-liquid-kde.trashcan/
 │       └── quickbar/
-│           ├── vscode-appmenu.patch              # QuickBar VS Code DBusMenu discovery
+│           ├── appmenu-pid-discovery.patch       # Find DBusMenu by active process PID
 │           └── build.sh                          # Rebuild and reinstall patched QuickBar
 ├── themes/
 │   ├── dark/                                     # Active dark overrides
@@ -159,13 +159,16 @@ dotfiles/
 │   │   ├── autostart/albert.desktop
 │   │   ├── config/{config,websearch/engines.json}
 │   │   └── share/widgetsboxmodel/themes/         # MacTahoe Albert themes
-│   └── dolphin/
-│       ├── applications/org.kde.dolphin.desktop
-│       ├── bin/dolphin
-│       ├── config/dolphinrc
-│       ├── kxmlgui5/dolphin/dolphinui.rc
-│       ├── kxmlgui6/dolphin/dolphinui.rc
-│       └── qss/dolphin.qss
+│   ├── dolphin/
+│   │   ├── applications/org.kde.dolphin.desktop
+│   │   ├── bin/dolphin
+│   │   ├── config/dolphinrc
+│   │   ├── kxmlgui5/dolphin/dolphinui.rc
+│   │   ├── kxmlgui6/dolphin/dolphinui.rc
+│   │   └── qss/dolphin.qss
+│   └── proton-vpn/
+│       ├── dbusmenu-export.patch                 # Export Proton VPN's Gio.Menu via DBusMenu
+│       └── apply.sh                              # Reapply patch after package updates
 ├── tooling/
 │   ├── convert/                                  # SVG recoloring and frosted-glass engine
 │   ├── tests/test_convert.py                     # Unit tests
@@ -376,9 +379,9 @@ The custom plasmoids provide the Apple menu, application title bar, launcher, an
 
 `desktop/kwin/effects/glass-auto-tint.patch` is a binary diff of the local changes to the KWin glass effect. It is kept as a patch rather than a full source tree. Apply it against the matching upstream source when rebuilding the effect.
 
-### QuickBar VS Code global menu patch
+### QuickBar appmenu PID fallback patch
 
-VS Code and other Electron applications export a DBusMenu but do not associate it with their window under Wayland, so `TaskManager` reports no application menu and QuickBar falls back to its generic menu. `desktop/plasma/quickbar/vscode-appmenu.patch` adds a fallback that finds the menu exported by the active process and displays it.
+Applications such as VS Code/Electron export a DBusMenu but do not associate it with their window under Wayland, so `TaskManager` reports no application menu and QuickBar falls back to its generic menu. `desktop/plasma/quickbar/appmenu-pid-discovery.patch` adds a fallback that finds the menu exported by the active process and displays it.
 
 `build.sh` clones the matching upstream tag, applies the patch, builds against the installed Plasma, installs the plugin to `/usr`, and restarts `plasmashell`:
 
@@ -387,6 +390,18 @@ VS Code and other Electron applications export a DBusMenu but do not associate i
 ```
 
 Re-run it after a `plasma6-applets-quickbar` upgrade, since the package replaces the patched plugin. Set `QUICKBAR_SRC` or `QUICKBAR_BUILD` to change the scratch directories.
+
+### Proton VPN global menu patch
+
+Proton VPN is a GTK4 application and does not export its header-bar menu over DBus. `apps/proton-vpn/dbusmenu-export.patch` adds a small exporter that publishes the app's existing `Gio.Menu` as a `com.canonical.dbusmenu` menu on `/com/canonical/menu/0`, which QuickBar then discovers for the active process.
+
+Apply it and restart Proton VPN:
+
+```bash
+./apps/proton-vpn/apply.sh
+```
+
+Re-run the script after a `proton-vpn-gtk-app` upgrade, since the package replaces the patched file. The patch targets `proton-vpn-gtk-app 4.18.8`. The exporter uses the `Dbusmenu` GObject typelib provided by `libdbusmenu-glib`.
 
 ### Wi-Fi and Finder icon patches
 
