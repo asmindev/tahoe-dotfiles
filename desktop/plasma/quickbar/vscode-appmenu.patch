@@ -1,0 +1,184 @@
+diff --git a/src/appmenumodel.cpp b/src/appmenumodel.cpp
+index 80c4d86..34db2ff 100644
+--- a/src/appmenumodel.cpp
++++ b/src/appmenumodel.cpp
+@@ -12,6 +12,9 @@
+ #include "menushortcutsender.h"
+ 
+ #include <QDBusConnection>
++#include <QDBusConnectionInterface>
++#include <QDBusMessage>
++#include <QDBusReply>
+ #include <QDBusServiceWatcher>
+ #include <QCoreApplication>
+ #include <QFileInfo>
+@@ -94,6 +97,69 @@ void collectMenuActions(QMenu *menu, QList<QAction *> &result, QSet<QMenu *> &vi
+         }
+     }
+ }
++
++QString findDBusMenuObjectPath(const QString &serviceName)
++{
++    const QDBusConnection bus = QDBusConnection::sessionBus();
++
++    const auto hasMenu = [&bus, &serviceName](const QString &path) {
++        QDBusMessage message = QDBusMessage::createMethodCall(serviceName,
++                                                              path,
++                                                              QStringLiteral("org.freedesktop.DBus.Properties"),
++                                                              QStringLiteral("Get"));
++        message << QStringLiteral("com.canonical.dbusmenu") << QStringLiteral("Version");
++        const QDBusMessage reply = bus.call(message, QDBus::Block, 100);
++        return reply.type() == QDBusMessage::ReplyMessage && !reply.arguments().isEmpty();
++    };
++
++    // Chromium/Electron exports its menu under /com/canonical/menu/<id>, and
++    // libdbusmenu-based applications use the same prefix (sometimes with an
++    // X11 window id). Probe a small range plus a couple of fallbacks.
++    for (int id = 0; id < 16; ++id) {
++        const QString path = QStringLiteral("/com/canonical/menu/%1").arg(id);
++        if (hasMenu(path)) {
++            return path;
++        }
++    }
++    for (const QString &path : {QStringLiteral("/MenuBar"), QStringLiteral("/com/canonical/menu/0x0")}) {
++        if (hasMenu(path)) {
++            return path;
++        }
++    }
++    return {};
++}
++
++bool findDBusMenuForPid(qint64 pid, QString &serviceName, QString &objectPath)
++{
++    if (pid <= 0) {
++        return false;
++    }
++
++    QDBusConnectionInterface *bus = QDBusConnection::sessionBus().interface();
++    if (!bus) {
++        return false;
++    }
++
++    const QStringList names = bus->registeredServiceNames().value();
++    for (const QString &name : names) {
++        // Menu exporters live on unique connections. Skipping well-known
++        // names halves the number of round trips on a typical session bus.
++        if (!name.startsWith(QLatin1Char(':'))) {
++            continue;
++        }
++        const QDBusReply<uint> reply = bus->servicePid(name);
++        if (!reply.isValid() || static_cast<qint64>(reply.value()) != pid) {
++            continue;
++        }
++        const QString path = findDBusMenuObjectPath(name);
++        if (!path.isEmpty()) {
++            serviceName = name;
++            objectPath = path;
++            return true;
++        }
++    }
++    return false;
++}
+ } // namespace
+ 
+ AppMenuModel::AppMenuModel(QObject *parent)
+@@ -148,6 +214,13 @@ AppMenuModel::AppMenuModel(QObject *parent)
+     // if our current DBus connection gets lost, close the menu
+     // we'll select the new menu when the focus changes
+     connect(m_serviceWatcher, &QDBusServiceWatcher::serviceUnregistered, this, [this](const QString &serviceName) {
++        for (auto it = m_discoveredMenus.begin(); it != m_discoveredMenus.end();) {
++            if (it.value().first == serviceName) {
++                it = m_discoveredMenus.erase(it);
++            } else {
++                ++it;
++            }
++        }
+         if (serviceName == m_serviceName) {
+             clearApplicationMenu();
+             onActiveWindowChanged();
+@@ -514,6 +587,37 @@ void AppMenuModel::update()
+     m_updatePending = false;
+ }
+ 
++bool AppMenuModel::tryDiscoverApplicationMenu(const QModelIndex &activeTaskIndex, QString &serviceName, QString &objectPath)
++{
++    const qint64 pid = m_tasksModel->data(activeTaskIndex, TaskManager::AbstractTasksModel::AppPid).toLongLong();
++    if (pid <= 0) {
++        return false;
++    }
++
++    const QDBusConnectionInterface *bus = QDBusConnection::sessionBus().interface();
++    if (!bus) {
++        return false;
++    }
++
++    auto cached = m_discoveredMenus.find(pid);
++    if (cached != m_discoveredMenus.end()) {
++        const QPair<QString, QString> location = cached.value();
++        if (bus->isServiceRegistered(location.first)) {
++            serviceName = location.first;
++            objectPath = location.second;
++            return true;
++        }
++        m_discoveredMenus.erase(cached);
++    }
++
++    if (!findDBusMenuForPid(pid, serviceName, objectPath)) {
++        return false;
++    }
++
++    m_discoveredMenus.insert(pid, qMakePair(serviceName, objectPath));
++    return true;
++}
++
+ void AppMenuModel::onActiveWindowChanged()
+ {
+     QuickBarApplet::ensureServiceRegistered();
+@@ -576,6 +680,14 @@ void AppMenuModel::onActiveWindowChanged()
+             return;
+         }
+ 
++        QString discoveredService;
++        QString discoveredPath;
++        if (tryDiscoverApplicationMenu(activeTaskIndex, discoveredService, discoveredPath)) {
++            m_usingGenericMenu = false;
++            updateApplicationMenu(discoveredService, discoveredPath);
++            return;
++        }
++
+         if (shouldUseGenericMenu(activeTaskIndex)) {
+             applyGenericMenu();
+             return;
+diff --git a/src/appmenumodel.h b/src/appmenumodel.h
+index 6bdff62..c9e5cbd 100644
+--- a/src/appmenumodel.h
++++ b/src/appmenumodel.h
+@@ -9,6 +9,8 @@
+ #include <KWindowSystem>
+ #include <QAbstractListModel>
+ #include <QAction>
++#include <QHash>
++#include <QPair>
+ #include <QPointer>
+ #include <QRect>
+ #include <QStringList>
+@@ -151,6 +153,11 @@ private:
+     void ensureGenericMenuCreated();
+     void applyGenericMenu();
+     void clearApplicationMenu();
++    // Some toolkits (notably Chromium/Electron on Wayland) export a DBusMenu
++    // but never associate it with the window through KWin, so TaskManager
++    // reports no application menu. Fall back to finding a menu exported by
++    // the active task's process.
++    bool tryDiscoverApplicationMenu(const QModelIndex &activeTaskIndex, QString &serviceName, QString &objectPath);
+     bool shouldUseGenericMenu(const QModelIndex &activeTaskIndex) const;
+     void quitActiveTask();
+     void minimizeActiveTask();
+@@ -174,6 +181,7 @@ private:
+     QDBusServiceWatcher *m_serviceWatcher;
+     QString m_serviceName;
+     QString m_menuObjectPath;
++    QHash<qint64, QPair<QString, QString>> m_discoveredMenus;
+ 
+     std::unique_ptr<KDBusMenuImporter> m_importer;
+ };

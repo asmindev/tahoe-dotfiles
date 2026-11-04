@@ -122,11 +122,14 @@ dotfiles/
 │       ├── look-and-feel/
 │       │   ├── MY LIGHT TAHOE/                   # Light global theme package
 │       │   └── MY TAHOE DARK/                    # Dark global theme package
-│       └── plasmoids/
-│           ├── com.github.antroids.application-title-bar/
-│           ├── org.51n7.kMenu/
-│           ├── org.kde.mac-tahoe-liquid-kde.launcher/
-│           └── org.kde.mac-tahoe-liquid-kde.trashcan/
+│       ├── plasmoids/
+│       │   ├── com.github.antroids.application-title-bar/
+│       │   ├── org.51n7.kMenu/
+│       │   ├── org.kde.mac-tahoe-liquid-kde.launcher/
+│       │   └── org.kde.mac-tahoe-liquid-kde.trashcan/
+│       └── quickbar/
+│           ├── vscode-appmenu.patch              # QuickBar VS Code DBusMenu discovery
+│           └── build.sh                          # Rebuild and reinstall patched QuickBar
 ├── themes/
 │   ├── dark/                                     # Active dark overrides
 │   │   ├── .gtkrc-2.0
@@ -372,6 +375,18 @@ The custom plasmoids provide the Apple menu, application title bar, launcher, an
 ### KWin glass effect patch
 
 `desktop/kwin/effects/glass-auto-tint.patch` is a binary diff of the local changes to the KWin glass effect. It is kept as a patch rather than a full source tree. Apply it against the matching upstream source when rebuilding the effect.
+
+### QuickBar VS Code global menu patch
+
+VS Code and other Electron applications export a DBusMenu but do not associate it with their window under Wayland, so `TaskManager` reports no application menu and QuickBar falls back to its generic menu. `desktop/plasma/quickbar/vscode-appmenu.patch` adds a fallback that finds the menu exported by the active process and displays it.
+
+`build.sh` clones the matching upstream tag, applies the patch, builds against the installed Plasma, installs the plugin to `/usr`, and restarts `plasmashell`:
+
+```bash
+./desktop/plasma/quickbar/build.sh
+```
+
+Re-run it after a `plasma6-applets-quickbar` upgrade, since the package replaces the patched plugin. Set `QUICKBAR_SRC` or `QUICKBAR_BUILD` to change the scratch directories.
 
 ### Wi-Fi and Finder icon patches
 
