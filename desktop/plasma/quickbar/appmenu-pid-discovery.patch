@@ -1,5 +1,5 @@
 diff --git a/src/appmenumodel.cpp b/src/appmenumodel.cpp
-index 80c4d86..34db2ff 100644
+index 80c4d86..6409a86 100644
 --- a/src/appmenumodel.cpp
 +++ b/src/appmenumodel.cpp
 @@ -12,6 +12,9 @@
@@ -149,6 +149,15 @@ index 80c4d86..34db2ff 100644
          if (shouldUseGenericMenu(activeTaskIndex)) {
              applyGenericMenu();
              return;
+@@ -929,7 +1041,7 @@ void AppMenuModel::updateApplicationMenu(const QString &serviceName, const QStri
+ 
+                 connect(a, &QAction::destroyed, this, &AppMenuModel::modelNeedsUpdate);
+ 
+-                if (a->menu()) {
++                if (a->menu() && a->menu()->actions().isEmpty()) {
+                     m_importer->updateMenu(a->menu());
+                 }
+             }
 diff --git a/src/appmenumodel.h b/src/appmenumodel.h
 index 6bdff62..c9e5cbd 100644
 --- a/src/appmenumodel.h
@@ -182,3 +191,211 @@ index 6bdff62..c9e5cbd 100644
  
      std::unique_ptr<KDBusMenuImporter> m_importer;
  };
+diff --git a/src/quickbarapplet.cpp b/src/quickbarapplet.cpp
+index c82aeb8..b7fc993 100644
+--- a/src/quickbarapplet.cpp
++++ b/src/quickbarapplet.cpp
+@@ -214,6 +214,9 @@ void QuickBarApplet::restoreStolenActions()
+         current->removeAction(action);
+         if (source) {
+             source->addAction(action);
++            if (QMenu *sub = action->menu()) {
++                sub->setParent(source, Qt::Popup);
++            }
+         }
+     }
+     if (source && menuAction) {
+@@ -267,9 +270,7 @@ void QuickBarApplet::setModel(QAbstractItemModel *model)
+         m_model = model;
+         if (m_model) {
+             connect(m_model, &QAbstractItemModel::modelReset, this, [this] {
+-                if (m_currentMenu && m_currentMenu->isVisible()) {
+-                    m_currentMenu->hide();
+-                }
++                // Background DBus layout updates reset the model but must not close the open menu
+             });
+         }
+         Q_EMIT modelChanged();
+@@ -439,6 +440,10 @@ int QuickBarApplet::calculateMaxHeightForCells(QMenu *menu, int maxCells) const
+         }
+     }
+ 
++    if (cellsSeen < maxCells) {
++        totalHeight += (maxCells - cellsSeen) * cellHeight;
++    }
++
+     QStyle *style = menu->style();
+     const int vmargin = style ? style->pixelMetric(QStyle::PM_MenuVMargin, nullptr, menu) : 2;
+     const int fw = style ? style->pixelMetric(QStyle::PM_MenuPanelWidth, nullptr, menu) : 2;
+@@ -612,6 +617,12 @@ void QuickBarApplet::onSubmenuAboutToShow()
+ {
+     if (auto *sub = qobject_cast<QMenu *>(sender())) {
+         clampSubmenu(sub);
++        if (m_currentMenu && m_currentMenu->windowHandle()) {
++            sub->winId();
++            if (sub->windowHandle()) {
++                sub->windowHandle()->setTransientParent(m_currentMenu->windowHandle());
++            }
++        }
+     }
+ }
+ 
+@@ -662,6 +673,9 @@ void QuickBarApplet::hookSubmenus(QMenu *menu)
+             action->setToolTip(action->text());
+         }
+         if (QMenu *sub = action->menu()) {
++            if (m_currentMenu && sub->parentWidget() != menu) {
++                sub->setParent(menu, Qt::Popup);
++            }
+             sub->removeEventFilter(this);
+             sub->installEventFilter(this);
+             connect(sub, &QMenu::aboutToShow, this, &QuickBarApplet::onSubmenuAboutToShow, Qt::UniqueConnection);
+@@ -723,7 +737,7 @@ void QuickBarApplet::trigger(QQuickItem *ctx, int idx)
+                 // Drop the borrowed refs and allocate our own reusable menu.
+                 m_currentMenu.clear();
+                 m_sourceMenu.clear();
+-                m_currentMenu = new QMenu(qobject_cast<QWidget *>(actionMenu->parent()));
++                m_currentMenu = new QMenu();
+                 if (m_menuStyle) {
+                     m_currentMenu->setStyle(m_menuStyle.get());
+                 }
+@@ -743,6 +757,9 @@ void QuickBarApplet::trigger(QQuickItem *ctx, int idx)
+                     m_currentMenu->removeAction(action);
+                     if (m_sourceMenu) {
+                         m_sourceMenu->addAction(action);
++                        if (QMenu *sub = action->menu()) {
++                            sub->setParent(m_sourceMenu.data(), Qt::Popup);
++                        }
+                     }
+                 }
+                 if (m_sourceMenu && menuAction) {
+@@ -754,6 +771,9 @@ void QuickBarApplet::trigger(QQuickItem *ctx, int idx)
+             for (QAction *action : m_sourceMenu->actions()) {
+                 m_sourceMenu->removeAction(action);
+                 m_currentMenu->addAction(action);
++                if (QMenu *sub = action->menu()) {
++                    sub->setParent(m_currentMenu.data(), Qt::Popup);
++                }
+             }
+             if (menuAction) {
+                 menuAction->setMenu(m_currentMenu);
+@@ -896,6 +916,14 @@ bool QuickBarApplet::eventFilter(QObject *watched, QEvent *event)
+ 
+     if (event->type() == QEvent::Paint || event->type() == QEvent::LayoutRequest || event->type() == QEvent::Show) {
+         clampActionRects(menu);
++        auto d = QMenuPrivate::get(menu);
++        if (d && d->scroll && d->scroll->scrollOffset == 0) {
++            if (totalContentHeight(menu) > menu->height()) {
++                d->scroll->scrollFlags = QMenuPrivate::QMenuScroller::ScrollDown;
++            } else {
++                d->scroll->scrollFlags = QMenuPrivate::QMenuScroller::ScrollNone;
++            }
++        }
+         if (event->type() == QEvent::Show) {
+             if (auto *lineEdit = menu->findChild<QLineEdit *>()) {
+                 QTimer::singleShot(0, lineEdit, [lineEdit]() {
+@@ -906,6 +934,20 @@ bool QuickBarApplet::eventFilter(QObject *watched, QEvent *event)
+         }
+     }
+ 
++    if (event->type() == QEvent::ActionAdded || event->type() == QEvent::ActionRemoved) {
++        if (menu->isVisible() && menu != m_currentMenu && !menu->property("_qb_clamp_pending").toBool()) {
++            menu->setProperty("_qb_clamp_pending", true);
++            QMetaObject::invokeMethod(this, [this, menu]() {
++                if (menu) {
++                    menu->setProperty("_qb_clamp_pending", false);
++                    if (menu->isVisible()) {
++                        clampSubmenu(menu);
++                    }
++                }
++            }, Qt::QueuedConnection);
++        }
++    }
++
+     if (event->type() == QEvent::Wheel) {
+         auto *e = static_cast<QWheelEvent *>(event);
+         handleMenuWheel(menu, e);
+diff --git a/third_party/libdbusmenuqt/dbusmenuimporter.cpp b/third_party/libdbusmenuqt/dbusmenuimporter.cpp
+index 7e82192..0f48c4b 100644
+--- a/third_party/libdbusmenuqt/dbusmenuimporter.cpp
++++ b/third_party/libdbusmenuqt/dbusmenuimporter.cpp
+@@ -17,6 +17,7 @@
+ #include <QDBusVariant>
+ #include <QDebug>
+ #include <QFont>
++#include <QHash>
+ #include <QMenu>
+ #include <QPointer>
+ #include <QSet>
+@@ -77,6 +78,7 @@ public:
+ 
+     QSet<int> m_idsRefreshedByAboutToShow;
+     QSet<int> m_pendingLayoutUpdates;
++    QHash<QMenu *, QPointer<QAction>> m_loadingActions;
+ 
+     QDBusPendingCallWatcher *refresh(int id)
+     {
+@@ -391,6 +393,8 @@ void DBusMenuImporter::slotGetLayoutFinished(QDBusPendingCallWatcher *watcher)
+         return;
+     }
+ 
++    QPointer<QAction> placeholder = d->m_loadingActions.take(menu);
++
+     // remove outdated actions
+     QSet<int> newDBusMenuItemIds;
+     newDBusMenuItemIds.reserve(rootItem.children.count());
+@@ -398,6 +402,9 @@ void DBusMenuImporter::slotGetLayoutFinished(QDBusPendingCallWatcher *watcher)
+         newDBusMenuItemIds << item.id;
+     }
+     for (QAction *action : menu->actions()) {
++        if (action == placeholder.data()) {
++            continue;
++        }
+         int id = action->property(DBUSMENU_PROPERTY_ID).toInt();
+         if (!newDBusMenuItemIds.contains(id)) {
+             // Not calling removeAction() as QMenu will immediately close when it becomes empty,
+@@ -447,6 +454,19 @@ void DBusMenuImporter::slotGetLayoutFinished(QDBusPendingCallWatcher *watcher)
+         }
+     }
+ 
++    if (placeholder) {
++        if (rootItem.children.isEmpty()) {
++            placeholder->setText(tr("(Empty)"));
++        } else {
++            menu->removeAction(placeholder);
++            placeholder->deleteLater();
++        }
++    }
++
++    if (menu->isVisible()) {
++        menu->adjustSize();
++    }
++
+     Q_EMIT menuUpdated(menu);
+ }
+ 
+@@ -502,8 +522,9 @@ void DBusMenuImporter::slotAboutToShowDBusCallFinished(QDBusPendingCallWatcher *
+     // Note, this isn't used by Qt's QPT - but we get a LayoutChanged emitted before
+     // this returns, which equates to the same thing
+     bool needRefresh = reply.argumentAt<0>();
++    bool hasOnlyPlaceholder = d->m_loadingActions.contains(menu);
+ 
+-    if (needRefresh || menu->actions().isEmpty()) {
++    if (needRefresh || hasOnlyPlaceholder || menu->actions().isEmpty()) {
+         d->m_idsRefreshedByAboutToShow << id;
+         d->refresh(id);
+     } else if (menu) {
+@@ -528,6 +549,13 @@ void DBusMenuImporter::slotMenuAboutToShow()
+     auto *menu = qobject_cast<QMenu *>(sender());
+     Q_ASSERT(menu);
+ 
++    if (menu->actions().isEmpty()) {
++        auto *loadingAction = new QAction(tr("Loading..."), menu);
++        loadingAction->setEnabled(false);
++        menu->addAction(loadingAction);
++        d->m_loadingActions.insert(menu, loadingAction);
++    }
++
+     updateMenu(menu);
+ }
+ 
