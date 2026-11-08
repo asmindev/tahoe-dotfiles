@@ -1,27 +1,97 @@
 diff --git a/src/appmenumodel.cpp b/src/appmenumodel.cpp
-index 80c4d86..6409a86 100644
+index 80c4d86..c730c61 100644
 --- a/src/appmenumodel.cpp
 +++ b/src/appmenumodel.cpp
-@@ -12,6 +12,9 @@
+@@ -11,15 +11,26 @@
+ #include "genericmenu.h"
  #include "menushortcutsender.h"
  
++#include <QDBusArgument>
  #include <QDBusConnection>
 +#include <QDBusConnectionInterface>
 +#include <QDBusMessage>
++#include <QDBusObjectPath>
 +#include <QDBusReply>
++#include <QDBusVariant>
  #include <QDBusServiceWatcher>
  #include <QCoreApplication>
  #include <QFileInfo>
-@@ -94,6 +97,69 @@ void collectMenuActions(QMenu *menu, QList<QAction *> &result, QSet<QMenu *> &vi
+ #include <QFile>
+ #include <QGuiApplication>
+ #include <QMenu>
++#include <QRegularExpression>
+ #include <QStandardPaths>
++#include <QThread>
+ #include <QUrl>
++#include <QVariantMap>
++#include <QVector>
++#include <QXmlStreamReader>
+ 
+ // Includes for the menu search.
+ #include <KLocalizedString>
+@@ -28,6 +39,7 @@
+ #include <QWidgetAction>
+ #include <algorithm>
+ #include <csignal>
++#include <memory>
+ #include <unistd.h>
+ 
+ #include <QTimer>
+@@ -38,8 +50,9 @@
+ class KDBusMenuImporter : public DBusMenuImporter
+ {
+ public:
+-    KDBusMenuImporter(const QString &service, const QString &path)
++    KDBusMenuImporter(const QString &service, const QString &path, AppMenuModel *model)
+         : DBusMenuImporter(service, path)
++        , m_model(model)
+     {
+     }
+ 
+@@ -48,6 +61,20 @@ protected:
+     {
+         return QIcon::fromTheme(name);
+     }
++
++    void actionActivated(int id) override
++    {
++        if (m_model) {
++            m_model->activateActiveTask();
++        }
++        // Small delay to ensure the window focus event settles on Wayland / Electron
++        QTimer::singleShot(50, this, [this, id]() {
++            sendClickedEvent(id);
++        });
++    }
++
++private:
++    AppMenuModel *m_model = nullptr;
+ };
+ 
+ namespace
+@@ -94,6 +121,792 @@ void collectMenuActions(QMenu *menu, QList<QAction *> &result, QSet<QMenu *> &vi
          }
      }
  }
++
++bool isStatusNotifierMenuPath(const QString &path)
++{
++    // StatusNotifierItem/AppIndicator exports its tray context menu through
++    // com.canonical.dbusmenu as well. That menu is not the application menu and
++    // must not be picked up by the fallback discovery.
++    return path.startsWith(QLatin1String("/org/ayatana/NotificationItem"))
++        || path.startsWith(QLatin1String("/org/kde/StatusNotifierItem"))
++        || path.startsWith(QLatin1String("/StatusNotifierItem"));
++}
 +
 +QString findDBusMenuObjectPath(const QString &serviceName)
 +{
 +    const QDBusConnection bus = QDBusConnection::sessionBus();
 +
 +    const auto hasMenu = [&bus, &serviceName](const QString &path) {
++        if (isStatusNotifierMenuPath(path)) {
++            return false;
++        }
 +        QDBusMessage message = QDBusMessage::createMethodCall(serviceName,
 +                                                              path,
 +                                                              QStringLiteral("org.freedesktop.DBus.Properties"),
@@ -45,6 +115,69 @@ index 80c4d86..6409a86 100644
 +            return path;
 +        }
 +    }
++
++    // Fall back to walking the service object tree. Some toolkits export the
++    // menu at a non-standard path, so hardcoding /com/canonical/menu is not
++    // enough. Bounded depth/node count keeps this cheap on the session bus.
++    struct Node {
++        QString path;
++        int depth;
++    };
++    QVector<Node> pending;
++    pending.append({QStringLiteral("/"), 0});
++    int inspected = 0;
++    while (!pending.isEmpty() && inspected < 64) {
++        const Node node = pending.takeLast();
++        if (node.depth > 4) {
++            continue;
++        }
++        ++inspected;
++
++        QDBusMessage message = QDBusMessage::createMethodCall(serviceName,
++                                                              node.path,
++                                                              QStringLiteral("org.freedesktop.DBus.Introspectable"),
++                                                              QStringLiteral("Introspect"));
++        const QDBusMessage reply = bus.call(message, QDBus::Block, 100);
++        if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
++            continue;
++        }
++
++        QXmlStreamReader reader(reply.arguments().first().toString());
++        bool hasDBusMenu = false;
++        QStringList children;
++        int xmlDepth = 0;
++        while (!reader.atEnd()) {
++            const QXmlStreamReader::TokenType token = reader.readNext();
++            if (token == QXmlStreamReader::StartElement) {
++                ++xmlDepth;
++                if (xmlDepth == 2) {
++                    if (reader.name() == QLatin1String("interface")) {
++                        if (reader.attributes().value(QLatin1String("name")) == QLatin1String("com.canonical.dbusmenu")) {
++                            hasDBusMenu = true;
++                        }
++                    } else if (reader.name() == QLatin1String("node")) {
++                        const QString name = reader.attributes().value(QLatin1String("name")).toString();
++                        if (!name.isEmpty() && !name.startsWith(QLatin1Char('/'))) {
++                            children.append(node.path == QLatin1String("/") ? QLatin1Char('/') + name
++                                                                            : node.path + QLatin1Char('/') + name);
++                        }
++                    }
++                }
++            } else if (token == QXmlStreamReader::EndElement) {
++                --xmlDepth;
++            }
++        }
++
++        if (hasDBusMenu && !isStatusNotifierMenuPath(node.path)) {
++            return node.path;
++        }
++        if (node.depth < 4) {
++            for (const QString &child : children) {
++                pending.append({child, node.depth + 1});
++            }
++        }
++    }
++
 +    return {};
 +}
 +
@@ -79,10 +212,657 @@ index 80c4d86..6409a86 100644
 +    }
 +    return false;
 +}
++
++constexpr auto atspiConnectionName = "quickbarAtspi";
++
++QDBusConnection atspiBus()
++{
++    static const QDBusConnection connection = [] {
++        const QDBusMessage message = QDBusMessage::createMethodCall(QStringLiteral("org.a11y.Bus"),
++                                                                    QStringLiteral("/org/a11y/bus"),
++                                                                    QStringLiteral("org.a11y.Bus"),
++                                                                    QStringLiteral("GetAddress"));
++        const QDBusMessage reply = QDBusConnection::sessionBus().call(message, QDBus::Block, 500);
++        if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
++            return QDBusConnection(QString::fromLatin1(atspiConnectionName));
++        }
++        return QDBusConnection::connectToBus(reply.arguments().first().toString(), QString::fromLatin1(atspiConnectionName));
++    }();
++    return connection;
++}
++
++QString atspiRole(const QDBusConnection &bus, const QString &service, const QString &path)
++{
++    const QDBusMessage reply =
++        bus.call(QDBusMessage::createMethodCall(service,
++                                                path,
++                                                QStringLiteral("org.a11y.atspi.Accessible"),
++                                                QStringLiteral("GetRoleName")),
++                 QDBus::Block,
++                 100);
++    if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
++        return {};
++    }
++    return reply.arguments().first().toString();
++}
++
++QString atspiName(const QDBusConnection &bus, const QString &service, const QString &path)
++{
++    QDBusMessage message = QDBusMessage::createMethodCall(service,
++                                                          path,
++                                                          QStringLiteral("org.freedesktop.DBus.Properties"),
++                                                          QStringLiteral("Get"));
++    message << QStringLiteral("org.a11y.atspi.Accessible") << QStringLiteral("Name");
++    const QDBusMessage reply = bus.call(message, QDBus::Block, 100);
++    if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
++        return {};
++    }
++    return qvariant_cast<QDBusVariant>(reply.arguments().first()).variant().toString();
++}
++
++QList<QPair<QString, QString>> atspiChildren(const QDBusConnection &bus, const QString &service, const QString &path)
++{
++    QList<QPair<QString, QString>> children;
++    const QDBusMessage reply =
++        bus.call(QDBusMessage::createMethodCall(service,
++                                                path,
++                                                QStringLiteral("org.a11y.atspi.Accessible"),
++                                                QStringLiteral("GetChildren")),
++                 QDBus::Block,
++                 100);
++    if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
++        return children;
++    }
++
++    const QDBusArgument argument = qvariant_cast<QDBusArgument>(reply.arguments().first());
++    argument.beginArray();
++    while (!argument.atEnd()) {
++        argument.beginStructure();
++        QString childService;
++        QDBusObjectPath childPath;
++        argument >> childService >> childPath;
++        argument.endStructure();
++        children.append(qMakePair(childService, childPath.path()));
++    }
++    argument.endArray();
++    return children;
++}
++
++bool atspiHasAction(const QDBusConnection &bus, const QString &service, const QString &path)
++{
++    const QDBusMessage reply =
++        bus.call(QDBusMessage::createMethodCall(service,
++                                                path,
++                                                QStringLiteral("org.a11y.atspi.Action"),
++                                                QStringLiteral("GetActions")),
++                 QDBus::Block,
++                 100);
++    if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
++        return false;
++    }
++    const QDBusArgument argument = qvariant_cast<QDBusArgument>(reply.arguments().first());
++    bool hasAction = false;
++    argument.beginArray();
++    while (!argument.atEnd()) {
++        argument.beginStructure();
++        QString name;
++        QString description;
++        QString key;
++        argument >> name >> description >> key;
++        argument.endStructure();
++        hasAction = true;
++    }
++    argument.endArray();
++    return hasAction;
++}
++
++void atspiDoAction(const QString &service, const QString &path)
++{
++    QDBusMessage message =
++        QDBusMessage::createMethodCall(service, path, QStringLiteral("org.a11y.atspi.Action"), QStringLiteral("DoAction"));
++    message << 0;
++    atspiBus().call(message, QDBus::Block, 500);
++}
++
++QString atspiMenuText(const QString &name)
++{
++    QString text = name;
++    text.remove(QLatin1Char('_'));
++    text = text.trimmed();
++
++    // Chromium/Electron appends the accelerator to the accessible name, e.g.
++    // "New Text File Ctrl+N". Keep only the label; the accelerator is not used
++    // by the panel menu.
++    static const QRegularExpression accelerator(
++        QStringLiteral("\\s+((Ctrl|Alt|Shift|Meta|Super|Cmd)\\+[^\\s]+)(\\s+(Ctrl|Alt|Shift|Meta|Super|Cmd)\\+[^\\s]+)*$"),
++        QRegularExpression::CaseInsensitiveOption);
++    text.remove(accelerator);
++    return text.trimmed();
++}
++
++bool atspiHasPopup(const QDBusConnection &bus, const QString &service, const QString &path)
++{
++    const QDBusMessage attributeReply =
++        bus.call(QDBusMessage::createMethodCall(service,
++                                                path,
++                                                QStringLiteral("org.a11y.atspi.Accessible"),
++                                                QStringLiteral("GetAttributes")),
++                 QDBus::Block,
++                 100);
++    if (attributeReply.type() == QDBusMessage::ReplyMessage && !attributeReply.arguments().isEmpty()) {
++        const QDBusArgument argument = qvariant_cast<QDBusArgument>(attributeReply.arguments().first());
++        QVariantMap attributes;
++        argument.beginMap();
++        while (!argument.atEnd()) {
++            argument.beginMapEntry();
++            QString key;
++            QString value;
++            argument >> key >> value;
++            argument.endMapEntry();
++            attributes.insert(key, value);
++        }
++        argument.endMap();
++
++        if (!attributes.value(QStringLiteral("haspopup")).toString().isEmpty()
++            || attributes.value(QStringLiteral("class")).toString().contains(QLatin1String("submenu"))) {
++            return true;
++        }
++    }
++
++    const QDBusMessage stateReply =
++        bus.call(QDBusMessage::createMethodCall(service,
++                                                path,
++                                                QStringLiteral("org.a11y.atspi.Accessible"),
++                                                QStringLiteral("GetState")),
++                 QDBus::Block,
++                 100);
++    if (stateReply.type() != QDBusMessage::ReplyMessage || stateReply.arguments().isEmpty()) {
++        return false;
++    }
++
++    const QDBusArgument argument = qvariant_cast<QDBusArgument>(stateReply.arguments().first());
++    argument.beginArray();
++    int word = 0;
++    bool hasPopup = false;
++    while (!argument.atEnd()) {
++        uint bits = 0;
++        argument >> bits;
++        if (word == 0 && (bits & (1u << 9))) { // ATSPI_STATE_EXPANDABLE
++            hasPopup = true;
++        }
++        if (word == 1 && (bits & (1u << (42 - 32)))) { // ATSPI_STATE_HAS_POPUP
++            hasPopup = true;
++        }
++        ++word;
++    }
++    argument.endArray();
++    return hasPopup;
++}
++
++bool atspiFindChildMenu(const QDBusConnection &bus,
++                        const QString &service,
++                        const QString &path,
++                        QString &menuService,
++                        QString &menuPath)
++{
++    for (const auto &child : atspiChildren(bus, service, path)) {
++        if (atspiRole(bus, child.first, child.second) == QLatin1String("menu")) {
++            menuService = child.first;
++            menuPath = child.second;
++            return true;
++        }
++    }
++    return false;
++}
++
++bool atspiIsShowing(const QDBusConnection &bus, const QString &service, const QString &path)
++{
++    const QDBusMessage reply =
++        bus.call(QDBusMessage::createMethodCall(service,
++                                                path,
++                                                QStringLiteral("org.a11y.atspi.Accessible"),
++                                                QStringLiteral("GetState")),
++                 QDBus::Block,
++                 100);
++    if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
++        return false;
++    }
++
++    const QDBusArgument argument = qvariant_cast<QDBusArgument>(reply.arguments().first());
++    argument.beginArray();
++    int word = 0;
++    bool showing = false;
++    while (!argument.atEnd()) {
++        uint bits = 0;
++        argument >> bits;
++        if (word == 0 && (bits & (1u << 25))) { // ATSPI_STATE_SHOWING
++            showing = true;
++            break;
++        }
++        ++word;
++    }
++    argument.endArray();
++    return showing;
++}
++
++bool atspiFindChildByName(const QDBusConnection &bus,
++                          const QString &service,
++                          const QString &path,
++                          const QString &text,
++                          QString &childService,
++                          QString &childPath)
++{
++    for (const auto &child : atspiChildren(bus, service, path)) {
++        const QString role = atspiRole(bus, child.first, child.second);
++        if (role != QLatin1String("menu") && role != QLatin1String("menu item")
++            && role != QLatin1String("check menu item") && role != QLatin1String("radio menu item")) {
++            continue;
++        }
++        if (atspiMenuText(atspiName(bus, child.first, child.second)) == text) {
++            childService = child.first;
++            childPath = child.second;
++            return true;
++        }
++    }
++    return false;
++}
++
++bool appHasAccessibilityEnabled(qint64 pid)
++{
++    if (pid <= 0) {
++        return false;
++    }
++
++    QFile environ(QStringLiteral("/proc/%1/environ").arg(pid));
++    if (environ.open(QIODevice::ReadOnly)) {
++        const QByteArray data = environ.readAll();
++        const int key = data.indexOf("ACCESSIBILITY_ENABLED=");
++        if (key >= 0) {
++            const int valueStart = key + int(sizeof("ACCESSIBILITY_ENABLED=")) - 1;
++            int valueEnd = data.indexOf('\0', valueStart);
++            if (valueEnd < 0) {
++                valueEnd = data.size();
++            }
++            const QByteArray value = data.mid(valueStart, valueEnd - valueStart).toLower();
++            if (value == "1" || value == "true" || value == "yes") {
++                return true;
++            }
++        }
++    }
++
++    QFile cmdline(QStringLiteral("/proc/%1/cmdline").arg(pid));
++    if (cmdline.open(QIODevice::ReadOnly)) {
++        return cmdline.readAll().contains("--force-renderer-accessibility");
++    }
++    return false;
++}
++
++QString normalizedAtspiTitle(QString title)
++{
++    title = title.trimmed();
++    while (!title.isEmpty() && !title.front().isLetterOrNumber()) {
++        title.remove(0, 1);
++    }
++    return title;
++}
++
++bool findAtspiFrame(const QDBusConnection &bus,
++                    const QString &service,
++                    const QString &path,
++                    const QString &title,
++                    QString &frameService,
++                    QString &framePath,
++                    int depth)
++{
++    if (depth > 6) {
++        return false;
++    }
++
++    const QString role = atspiRole(bus, service, path);
++    if (role == QLatin1String("frame") || role == QLatin1String("window") || role == QLatin1String("dialog")) {
++        const QString frameName = normalizedAtspiTitle(atspiName(bus, service, path));
++        const QString wanted = normalizedAtspiTitle(title);
++        if (!frameName.isEmpty() && !wanted.isEmpty()
++            && (frameName == wanted || frameName.contains(wanted) || wanted.contains(frameName))) {
++            frameService = service;
++            framePath = path;
++            return true;
++        }
++    }
++
++    for (const auto &child : atspiChildren(bus, service, path)) {
++        if (findAtspiFrame(bus, child.first, child.second, title, frameService, framePath, depth + 1)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool findAtspiMenuBar(const QDBusConnection &bus,
++                      const QString &service,
++                      const QString &path,
++                      QString &menuService,
++                      QString &menuPath,
++                      int depth)
++{
++    // Electron embeds the menu bar deep inside the window's accessibility
++    // tree (Chromium's Views tree is ~15 levels deep in VS Code).
++    if (depth > 20) {
++        return false;
++    }
++
++    if (atspiRole(bus, service, path) == QLatin1String("menu bar")) {
++        menuService = service;
++        menuPath = path;
++        return true;
++    }
++
++    for (const auto &child : atspiChildren(bus, service, path)) {
++        if (findAtspiMenuBar(bus, child.first, child.second, menuService, menuPath, depth + 1)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool findAtspiMenu(const QDBusConnection &bus,
++                   const QString &appService,
++                   const QString &appRoot,
++                   const QString &windowTitle,
++                   QString &menuService,
++                   QString &menuPath)
++{
++    if (!windowTitle.isEmpty()) {
++        QString frameService;
++        QString framePath;
++        if (findAtspiFrame(bus, appService, appRoot, windowTitle, frameService, framePath, 0)
++            && findAtspiMenuBar(bus, frameService, framePath, menuService, menuPath, 0)) {
++            return true;
++        }
++    }
++
++    return findAtspiMenuBar(bus, appService, appRoot, menuService, menuPath, 0);
++}
++
++bool atspiWaitChildMenu(const QDBusConnection &bus,
++                        const QString &service,
++                        const QString &path,
++                        QString &menuService,
++                        QString &menuPath)
++{
++    for (int i = 0; i < 60; ++i) {
++        if (atspiFindChildMenu(bus, service, path, menuService, menuPath)) {
++            return true;
++        }
++        QThread::msleep(5);
++    }
++    return false;
++}
++
++bool atspiOpenPath(const QDBusConnection &bus,
++                   const QString &menuBarService,
++                   const QString &menuBarPath,
++                   const QString &topText,
++                   const QStringList &path,
++                   QString &menuService,
++                   QString &menuPath)
++{
++    QString itemService;
++    QString itemPath;
++    if (!atspiFindChildByName(bus, menuBarService, menuBarPath, topText, itemService, itemPath)) {
++        return false;
++    }
++
++    atspiDoAction(itemService, itemPath);
++    if (!atspiWaitChildMenu(bus, itemService, itemPath, menuService, menuPath)) {
++        return false;
++    }
++
++    for (const QString &name : path) {
++        if (!atspiFindChildByName(bus, menuService, menuPath, name, itemService, itemPath)) {
++            return false;
++        }
++        atspiDoAction(itemService, itemPath);
++        if (!atspiWaitChildMenu(bus, itemService, itemPath, menuService, menuPath)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++void atspiCloseTop(const QDBusConnection &bus,
++                   const QString &menuBarService,
++                   const QString &menuBarPath,
++                   const QString &topText)
++{
++    QString itemService;
++    QString itemPath;
++    if (!atspiFindChildByName(bus, menuBarService, menuBarPath, topText, itemService, itemPath)) {
++        return;
++    }
++
++    QString menuService;
++    QString menuPath;
++    if (atspiFindChildMenu(bus, itemService, itemPath, menuService, menuPath)
++        && atspiIsShowing(bus, menuService, menuPath)) {
++        atspiDoAction(itemService, itemPath);
++    }
++}
++
++bool atspiActivatePath(const QDBusConnection &bus,
++                       const QString &menuBarService,
++                       const QString &menuBarPath,
++                       const QString &topText,
++                       const QStringList &path)
++{
++    if (path.isEmpty()) {
++        return false;
++    }
++
++    QString itemService;
++    QString itemPath;
++    if (!atspiFindChildByName(bus, menuBarService, menuBarPath, topText, itemService, itemPath)) {
++        return false;
++    }
++
++    atspiDoAction(itemService, itemPath);
++    QString menuService;
++    QString menuPath;
++    if (!atspiWaitChildMenu(bus, itemService, itemPath, menuService, menuPath)) {
++        atspiCloseTop(bus, menuBarService, menuBarPath, topText);
++        return false;
++    }
++
++    for (int i = 0; i < path.size(); ++i) {
++        if (!atspiFindChildByName(bus, menuService, menuPath, path.at(i), itemService, itemPath)) {
++            atspiCloseTop(bus, menuBarService, menuBarPath, topText);
++            return false;
++        }
++        atspiDoAction(itemService, itemPath);
++        if (i + 1 < path.size() && !atspiWaitChildMenu(bus, itemService, itemPath, menuService, menuPath)) {
++            atspiCloseTop(bus, menuBarService, menuBarPath, topText);
++            return false;
++        }
++    }
++
++    atspiCloseTop(bus, menuBarService, menuBarPath, topText);
++    return true;
++}
++
++void buildAtspiMenu(const QDBusConnection &bus,
++                    const QString &menuBarService,
++                    const QString &menuBarPath,
++                    const QString &topText,
++                    const QString &service,
++                    const QString &path,
++                    const QStringList &prefix,
++                    QMenu *menu,
++                    int depth)
++{
++    if (!menu || depth > 8) {
++        return;
++    }
++
++    for (const auto &child : atspiChildren(bus, service, path)) {
++        const QString childService = child.first;
++        const QString childPath = child.second;
++        const QString role = atspiRole(bus, childService, childPath);
++
++        if (role == QLatin1String("separator")) {
++            menu->addSeparator();
++            continue;
++        }
++        if (role != QLatin1String("menu") && role != QLatin1String("menu item")
++            && role != QLatin1String("check menu item") && role != QLatin1String("radio menu item")) {
++            continue;
++        }
++
++        const QString text = atspiMenuText(atspiName(bus, childService, childPath));
++        if (text.isEmpty()) {
++            continue;
++        }
++
++        QAction *action = menu->addAction(text);
++
++        // When building the menu bar itself, every top-level item becomes the
++        // root of its own lazily loaded popup. Inside a popup, names are
++        // accumulated so an action can be replayed after the native menu has
++        // been closed and its accessibility objects have been destroyed.
++        const QString itemTopText = topText.isEmpty() ? text : topText;
++        QStringList itemPrefix;
++        if (!topText.isEmpty()) {
++            itemPrefix = prefix;
++            itemPrefix.append(text);
++        }
++
++        if (role == QLatin1String("menu")) {
++            QMenu *submenu = new QMenu(menu);
++            action->setMenu(submenu);
++            buildAtspiMenu(bus, menuBarService, menuBarPath, itemTopText, childService, childPath, itemPrefix, submenu, depth + 1);
++            if (submenu->isEmpty()) {
++                action->setEnabled(false);
++            }
++        } else if (atspiHasPopup(bus, childService, childPath)) {
++            QMenu *submenu = new QMenu(menu);
++            action->setMenu(submenu);
++            QAction *placeholder = submenu->addAction(QCoreApplication::translate("AppMenuModel", "Loading..."));
++            placeholder->setEnabled(false);
++
++            const QStringList openPath = itemPrefix;
++            QObject::connect(submenu,
++                             &QMenu::aboutToShow,
++                             submenu,
++                             [bus, menuBarService, menuBarPath, itemTopText, openPath, submenu, depth] {
++                                 QString menuService;
++                                 QString menuPath;
++                                 const bool opened = atspiOpenPath(bus,
++                                                                   menuBarService,
++                                                                   menuBarPath,
++                                                                   itemTopText,
++                                                                   openPath,
++                                                                   menuService,
++                                                                   menuPath);
++                                 submenu->clear();
++                                 if (opened) {
++                                     buildAtspiMenu(bus,
++                                                    menuBarService,
++                                                    menuBarPath,
++                                                    itemTopText,
++                                                    menuService,
++                                                    menuPath,
++                                                    openPath,
++                                                    submenu,
++                                                    depth + 1);
++                                 }
++                                 if (submenu->isEmpty()) {
++                                     QAction *empty = submenu->addAction(QCoreApplication::translate("AppMenuModel", "No menu items"));
++                                     empty->setEnabled(false);
++                                 }
++                                 atspiCloseTop(bus, menuBarService, menuBarPath, itemTopText);
++                             });
++
++            QObject::connect(submenu,
++                             &QMenu::aboutToHide,
++                             submenu,
++                             [bus, menuBarService, menuBarPath, itemTopText] {
++                                 atspiCloseTop(bus, menuBarService, menuBarPath, itemTopText);
++                             });
++        } else {
++            const bool enabled = atspiHasAction(bus, childService, childPath);
++            action->setEnabled(enabled);
++            if (enabled) {
++                const QStringList activatePath = itemPrefix;
++                QObject::connect(action,
++                                 &QAction::triggered,
++                                 action,
++                                 [bus, menuBarService, menuBarPath, itemTopText, activatePath] {
++                                     atspiActivatePath(bus,
++                                                       menuBarService,
++                                                       menuBarPath,
++                                                       itemTopText,
++                                                       activatePath);
++                                 });
++            }
++        }
++    }
++}
++
++bool findAtspiAppRoot(const QDBusConnection &bus,
++                      qint64 pid,
++                      const QString &appId,
++                      const QString &appName,
++                      const QString &windowTitle,
++                      QString &service,
++                      QString &rootPath)
++{
++    const QString registryService = QStringLiteral("org.a11y.atspi.Registry");
++    const QString registryPath = QStringLiteral("/org/a11y/atspi/accessible/root");
++    const auto apps = atspiChildren(bus, registryService, registryPath);
++
++    for (const auto &app : apps) {
++        if (pid > 0) {
++            QDBusMessage pidMessage = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.DBus"),
++                                                                      QStringLiteral("/org/freedesktop/DBus"),
++                                                                      QStringLiteral("org.freedesktop.DBus"),
++                                                                      QStringLiteral("GetConnectionUnixProcessID"));
++            pidMessage << app.first;
++            const QDBusMessage pidReply = bus.call(pidMessage, QDBus::Block, 100);
++            if (pidReply.type() == QDBusMessage::ReplyMessage && !pidReply.arguments().isEmpty()
++                && static_cast<qint64>(pidReply.arguments().first().toUInt()) == pid) {
++                service = app.first;
++                rootPath = app.second;
++                return true;
++            }
++        }
++
++        const QString name = atspiName(bus, app.first, app.second);
++        if ((!appId.isEmpty() && name.compare(appId, Qt::CaseInsensitive) == 0)
++            || (!appName.isEmpty() && name.compare(appName, Qt::CaseInsensitive) == 0)) {
++            service = app.first;
++            rootPath = app.second;
++            return true;
++        }
++    }
++
++    if (windowTitle.isEmpty()) {
++        return false;
++    }
++
++    for (const auto &app : apps) {
++        QString frameService;
++        QString framePath;
++        if (findAtspiFrame(bus, app.first, app.second, windowTitle, frameService, framePath, 0)) {
++            service = app.first;
++            rootPath = app.second;
++            return true;
++        }
++    }
++    return false;
++}
  } // namespace
  
  AppMenuModel::AppMenuModel(QObject *parent)
-@@ -148,6 +214,13 @@ AppMenuModel::AppMenuModel(QObject *parent)
+@@ -148,6 +961,13 @@ AppMenuModel::AppMenuModel(QObject *parent)
      // if our current DBus connection gets lost, close the menu
      // we'll select the new menu when the focus changes
      connect(m_serviceWatcher, &QDBusServiceWatcher::serviceUnregistered, this, [this](const QString &serviceName) {
@@ -96,7 +876,7 @@ index 80c4d86..6409a86 100644
          if (serviceName == m_serviceName) {
              clearApplicationMenu();
              onActiveWindowChanged();
-@@ -514,6 +587,37 @@ void AppMenuModel::update()
+@@ -514,6 +1334,123 @@ void AppMenuModel::update()
      m_updatePending = false;
  }
  
@@ -131,10 +911,109 @@ index 80c4d86..6409a86 100644
 +    return true;
 +}
 +
++bool AppMenuModel::tryApplyAtspiMenu(const QModelIndex &activeTaskIndex)
++{
++    if (!activeTaskIndex.isValid()) {
++        return false;
++    }
++
++    const qint64 pid = m_tasksModel->data(activeTaskIndex, TaskManager::AbstractTasksModel::AppPid).toLongLong();
++    QString appId = m_tasksModel->data(activeTaskIndex, TaskManager::AbstractTasksModel::AppId).toString();
++    if (appId.endsWith(QLatin1String(".desktop"))) {
++        appId.chop(8);
++    }
++    const QString appName = m_tasksModel->data(activeTaskIndex, TaskManager::AbstractTasksModel::AppName).toString();
++    const QString windowTitle = m_tasksModel->data(activeTaskIndex, Qt::DisplayRole).toString();
++
++    // Include the PID: multiple windows of the same application can have
++    // different accessibility trees (e.g. one Electron instance started with
++    // ACCESSIBILITY_ENABLED and another without).
++    QString key = appId;
++    if (key.isEmpty()) {
++        key = appName;
++    }
++    if (key.isEmpty()) {
++        key = windowTitle;
++    }
++    if (key.isEmpty()) {
++        return false;
++    }
++    key += QLatin1Char(':') + QString::number(pid);
++
++    if (m_atspiChecked && key == m_atspiKey) {
++        if (!m_atspiHasMenu || !m_atspiMenu) {
++            return false;
++        }
++        m_usingGenericMenu = false;
++        m_serviceName.clear();
++        m_menuObjectPath.clear();
++        m_serviceWatcher->setWatchedServices({});
++        m_importer.reset();
++        m_menu = m_atspiMenu.get();
++        setMenuAvailable(true);
++        setVisible(true);
++        Q_EMIT modelNeedsUpdate();
++        return true;
++    }
++
++    m_atspiKey = key;
++    m_atspiChecked = true;
++    m_atspiHasMenu = false;
++
++    const QDBusConnection bus = atspiBus();
++    if (!bus.isConnected()) {
++        return false;
++    }
++
++    QString service;
++    QString rootPath;
++    if (!findAtspiAppRoot(bus, pid, appId, appName, windowTitle, service, rootPath)) {
++        return false;
++    }
++
++    QString menuService;
++    QString menuPath;
++    if (!findAtspiMenu(bus, service, rootPath, windowTitle, menuService, menuPath)) {
++        return false;
++    }
++
++    std::unique_ptr<QMenu> menu(new QMenu());
++    buildAtspiMenu(bus, menuService, menuPath, QString(), menuService, menuPath, QStringList(), menu.get(), 0);
++    if (menu->isEmpty()) {
++        return false;
++    }
++
++    m_atspiMenu = std::move(menu);
++    m_atspiHasMenu = true;
++    m_usingGenericMenu = false;
++    m_serviceName.clear();
++    m_menuObjectPath.clear();
++    m_serviceWatcher->setWatchedServices({});
++    m_importer.reset();
++    m_menu = m_atspiMenu.get();
++    setMenuAvailable(true);
++    setVisible(true);
++    Q_EMIT modelNeedsUpdate();
++    return true;
++}
++
  void AppMenuModel::onActiveWindowChanged()
  {
      QuickBarApplet::ensureServiceRegistered();
-@@ -576,6 +680,14 @@ void AppMenuModel::onActiveWindowChanged()
+@@ -567,6 +1504,12 @@ void AppMenuModel::onActiveWindowChanged()
+     refreshActiveWindowMaximized();
+ 
+     if (activeTaskIndex.isValid()) {
++        const qint64 activePid = m_tasksModel->data(activeTaskIndex, TaskManager::AbstractTasksModel::AppPid).toLongLong();
++        const bool preferAtspi = appHasAccessibilityEnabled(activePid);
++        if (preferAtspi && tryApplyAtspiMenu(activeTaskIndex)) {
++            return;
++        }
++
+         const QString objectPath = m_tasksModel->data(activeTaskIndex, TaskManager::AbstractTasksModel::ApplicationMenuObjectPath).toString();
+         const QString serviceName = m_tasksModel->data(activeTaskIndex, TaskManager::AbstractTasksModel::ApplicationMenuServiceName).toString();
+ 
+@@ -576,6 +1519,18 @@ void AppMenuModel::onActiveWindowChanged()
              return;
          }
  
@@ -146,10 +1025,53 @@ index 80c4d86..6409a86 100644
 +            return;
 +        }
 +
++        if (!preferAtspi && tryApplyAtspiMenu(activeTaskIndex)) {
++            return;
++        }
++
          if (shouldUseGenericMenu(activeTaskIndex)) {
              applyGenericMenu();
              return;
-@@ -929,7 +1041,7 @@ void AppMenuModel::updateApplicationMenu(const QString &serviceName, const QStri
+@@ -609,6 +1564,10 @@ void AppMenuModel::clearApplicationMenu()
+     m_menuObjectPath.clear();
+     m_serviceWatcher->setWatchedServices({});
+     m_importer.reset();
++    m_atspiMenu.reset();
++    m_atspiKey.clear();
++    m_atspiChecked = false;
++    m_atspiHasMenu = false;
+     m_menu.clear();
+     Q_EMIT modelNeedsUpdate();
+ }
+@@ -659,6 +1618,18 @@ void AppMenuModel::maximizeActiveTask()
+     m_tasksModel->requestToggleMaximized(activeTaskIndex);
+ }
+ 
++void AppMenuModel::activateActiveTask()
++{
++    if (!m_tasksModel) {
++        return;
++    }
++
++    const QModelIndex activeTaskIndex = m_tasksModel->activeTask();
++    if (activeTaskIndex.isValid()) {
++        m_tasksModel->requestActivate(activeTaskIndex);
++    }
++}
++
+ void AppMenuModel::wireGenericMenuActions(QMenu *menu)
+ {
+     if (!menu) {
+@@ -879,7 +1850,7 @@ void AppMenuModel::updateApplicationMenu(const QString &serviceName, const QStri
+         m_menuObjectPath = menuObjectPath;
+         m_serviceWatcher->setWatchedServices(QStringList({m_serviceName}));
+ 
+-        m_importer = std::make_unique<KDBusMenuImporter>(serviceName, menuObjectPath);
++        m_importer = std::make_unique<KDBusMenuImporter>(serviceName, menuObjectPath, this);
+         m_menu = m_importer->menu();
+         QMetaObject::invokeMethod(m_importer.get(), "updateMenu", Qt::QueuedConnection);
+ 
+@@ -929,7 +1900,7 @@ void AppMenuModel::updateApplicationMenu(const QString &serviceName, const QStri
  
                  connect(a, &QAction::destroyed, this, &AppMenuModel::modelNeedsUpdate);
  
@@ -159,7 +1081,7 @@ index 80c4d86..6409a86 100644
                  }
              }
 diff --git a/src/appmenumodel.h b/src/appmenumodel.h
-index 6bdff62..c9e5cbd 100644
+index 6bdff62..9bb6d39 100644
 --- a/src/appmenumodel.h
 +++ b/src/appmenumodel.h
 @@ -9,6 +9,8 @@
@@ -171,7 +1093,15 @@ index 6bdff62..c9e5cbd 100644
  #include <QPointer>
  #include <QRect>
  #include <QStringList>
-@@ -151,6 +153,11 @@ private:
+@@ -91,6 +93,7 @@ public:
+     void setScreenGeometry(QRect geometry);
+     QList<QAction *> flatActionList();
+     QList<QAction *> visibleActions() const;
++    void activateActiveTask();
+ 
+ Q_SIGNALS:
+     void requestActivateIndex(int index);
+@@ -151,6 +154,16 @@ private:
      void ensureGenericMenuCreated();
      void applyGenericMenu();
      void clearApplicationMenu();
@@ -180,19 +1110,31 @@ index 6bdff62..c9e5cbd 100644
 +    // reports no application menu. Fall back to finding a menu exported by
 +    // the active task's process.
 +    bool tryDiscoverApplicationMenu(const QModelIndex &activeTaskIndex, QString &serviceName, QString &objectPath);
++    // Toolkits that draw their own menus (egui, CEF, some GTK builds) may still
++    // expose the menu through AT-SPI. Use it before DBusMenu when the process
++    // opted into accessibility, and as a fallback before the generic desktop
++    // menu otherwise.
++    bool tryApplyAtspiMenu(const QModelIndex &activeTaskIndex);
      bool shouldUseGenericMenu(const QModelIndex &activeTaskIndex) const;
      void quitActiveTask();
      void minimizeActiveTask();
-@@ -174,6 +181,7 @@ private:
+@@ -174,6 +187,14 @@ private:
      QDBusServiceWatcher *m_serviceWatcher;
      QString m_serviceName;
      QString m_menuObjectPath;
 +    QHash<qint64, QPair<QString, QString>> m_discoveredMenus;
++
++    // AT-SPI fallback menu and the app it belongs to. Cached so the frequent
++    // dataChanged() calls from the tasks model do not rebuild the tree.
++    std::unique_ptr<QMenu> m_atspiMenu;
++    QString m_atspiKey;
++    bool m_atspiChecked = false;
++    bool m_atspiHasMenu = false;
  
      std::unique_ptr<KDBusMenuImporter> m_importer;
  };
 diff --git a/src/quickbarapplet.cpp b/src/quickbarapplet.cpp
-index c82aeb8..b7fc993 100644
+index c82aeb8..95f97c5 100644
 --- a/src/quickbarapplet.cpp
 +++ b/src/quickbarapplet.cpp
 @@ -214,6 +214,9 @@ void QuickBarApplet::restoreStolenActions()
@@ -227,7 +1169,7 @@ index c82aeb8..b7fc993 100644
      QStyle *style = menu->style();
      const int vmargin = style ? style->pixelMetric(QStyle::PM_MenuVMargin, nullptr, menu) : 2;
      const int fw = style ? style->pixelMetric(QStyle::PM_MenuPanelWidth, nullptr, menu) : 2;
-@@ -612,6 +617,12 @@ void QuickBarApplet::onSubmenuAboutToShow()
+@@ -612,6 +617,16 @@ void QuickBarApplet::onSubmenuAboutToShow()
  {
      if (auto *sub = qobject_cast<QMenu *>(sender())) {
          clampSubmenu(sub);
@@ -237,10 +1179,14 @@ index c82aeb8..b7fc993 100644
 +                sub->windowHandle()->setTransientParent(m_currentMenu->windowHandle());
 +            }
 +        }
++        // Menus built lazily (e.g. from AT-SPI) only get their actions after
++        // this signal is emitted. Hook the submenus that were just created so
++        // they are clamped and parented like the rest of the menu tree.
++        hookSubmenus(sub);
      }
  }
  
-@@ -662,6 +673,9 @@ void QuickBarApplet::hookSubmenus(QMenu *menu)
+@@ -662,6 +677,9 @@ void QuickBarApplet::hookSubmenus(QMenu *menu)
              action->setToolTip(action->text());
          }
          if (QMenu *sub = action->menu()) {
@@ -250,7 +1196,7 @@ index c82aeb8..b7fc993 100644
              sub->removeEventFilter(this);
              sub->installEventFilter(this);
              connect(sub, &QMenu::aboutToShow, this, &QuickBarApplet::onSubmenuAboutToShow, Qt::UniqueConnection);
-@@ -723,7 +737,7 @@ void QuickBarApplet::trigger(QQuickItem *ctx, int idx)
+@@ -723,7 +741,7 @@ void QuickBarApplet::trigger(QQuickItem *ctx, int idx)
                  // Drop the borrowed refs and allocate our own reusable menu.
                  m_currentMenu.clear();
                  m_sourceMenu.clear();
@@ -259,7 +1205,7 @@ index c82aeb8..b7fc993 100644
                  if (m_menuStyle) {
                      m_currentMenu->setStyle(m_menuStyle.get());
                  }
-@@ -743,6 +757,9 @@ void QuickBarApplet::trigger(QQuickItem *ctx, int idx)
+@@ -743,6 +761,9 @@ void QuickBarApplet::trigger(QQuickItem *ctx, int idx)
                      m_currentMenu->removeAction(action);
                      if (m_sourceMenu) {
                          m_sourceMenu->addAction(action);
@@ -269,7 +1215,7 @@ index c82aeb8..b7fc993 100644
                      }
                  }
                  if (m_sourceMenu && menuAction) {
-@@ -754,6 +771,9 @@ void QuickBarApplet::trigger(QQuickItem *ctx, int idx)
+@@ -754,6 +775,9 @@ void QuickBarApplet::trigger(QQuickItem *ctx, int idx)
              for (QAction *action : m_sourceMenu->actions()) {
                  m_sourceMenu->removeAction(action);
                  m_currentMenu->addAction(action);
@@ -279,7 +1225,7 @@ index c82aeb8..b7fc993 100644
              }
              if (menuAction) {
                  menuAction->setMenu(m_currentMenu);
-@@ -896,6 +916,14 @@ bool QuickBarApplet::eventFilter(QObject *watched, QEvent *event)
+@@ -896,6 +920,14 @@ bool QuickBarApplet::eventFilter(QObject *watched, QEvent *event)
  
      if (event->type() == QEvent::Paint || event->type() == QEvent::LayoutRequest || event->type() == QEvent::Show) {
          clampActionRects(menu);
@@ -294,7 +1240,7 @@ index c82aeb8..b7fc993 100644
          if (event->type() == QEvent::Show) {
              if (auto *lineEdit = menu->findChild<QLineEdit *>()) {
                  QTimer::singleShot(0, lineEdit, [lineEdit]() {
-@@ -906,6 +934,20 @@ bool QuickBarApplet::eventFilter(QObject *watched, QEvent *event)
+@@ -906,6 +938,20 @@ bool QuickBarApplet::eventFilter(QObject *watched, QEvent *event)
          }
      }
  
@@ -316,7 +1262,7 @@ index c82aeb8..b7fc993 100644
          auto *e = static_cast<QWheelEvent *>(event);
          handleMenuWheel(menu, e);
 diff --git a/third_party/libdbusmenuqt/dbusmenuimporter.cpp b/third_party/libdbusmenuqt/dbusmenuimporter.cpp
-index 7e82192..0f48c4b 100644
+index 7e82192..4b08a09 100644
 --- a/third_party/libdbusmenuqt/dbusmenuimporter.cpp
 +++ b/third_party/libdbusmenuqt/dbusmenuimporter.cpp
 @@ -17,6 +17,7 @@
@@ -374,18 +1320,26 @@ index 7e82192..0f48c4b 100644
      Q_EMIT menuUpdated(menu);
  }
  
-@@ -502,8 +522,9 @@ void DBusMenuImporter::slotAboutToShowDBusCallFinished(QDBusPendingCallWatcher *
+@@ -501,14 +521,10 @@ void DBusMenuImporter::slotAboutToShowDBusCallFinished(QDBusPendingCallWatcher *
+     }
      // Note, this isn't used by Qt's QPT - but we get a LayoutChanged emitted before
      // this returns, which equates to the same thing
-     bool needRefresh = reply.argumentAt<0>();
-+    bool hasOnlyPlaceholder = d->m_loadingActions.contains(menu);
- 
+-    bool needRefresh = reply.argumentAt<0>();
+-
 -    if (needRefresh || menu->actions().isEmpty()) {
-+    if (needRefresh || hasOnlyPlaceholder || menu->actions().isEmpty()) {
-         d->m_idsRefreshedByAboutToShow << id;
-         d->refresh(id);
-     } else if (menu) {
-@@ -528,6 +549,13 @@ void DBusMenuImporter::slotMenuAboutToShow()
+-        d->m_idsRefreshedByAboutToShow << id;
+-        d->refresh(id);
+-    } else if (menu) {
+-        Q_EMIT menuUpdated(menu);
+-    }
++    // Always refresh layout on AboutToShow because Electron/Chromium rebuilds
++    // children with new IDs every time a submenu is opened.
++    d->m_idsRefreshedByAboutToShow << id;
++    d->refresh(id);
+ }
+ 
+ void DBusMenuImporter::slotMenuAboutToHide()
+@@ -528,6 +544,13 @@ void DBusMenuImporter::slotMenuAboutToShow()
      auto *menu = qobject_cast<QMenu *>(sender());
      Q_ASSERT(menu);
  
